@@ -123,7 +123,7 @@ struct fmha_fwd_base
     std::string name() const { return "gpu::fmha_fwd_base"; }
 
     // Inputs: [Q, K, V] or [Q, K, bias, V]
-    // K is [batch, nhead, N, K] (un-transposed for FMHA).
+    // K may be [batch, nhead, N, K] (un-transposed) or [batch, nhead, K, N] (transposed).
     shape compute_shape(std::vector<shape> inputs, const std::vector<module_ref>&) const
     {
         check_shapes{inputs, *this}.same_ndims();
@@ -132,14 +132,16 @@ struct fmha_fwd_base
                            to_string(inputs.size()));
 
         const auto& q_shape = inputs[0];     // [batch, nhead, M, K]
-        const auto& k_shape = inputs[1];     // [batch, nhead, N, K]
+        const auto& k_shape = inputs[1];
         const auto& v_shape = inputs.back(); // [batch, nhead, N, O]
 
         auto rank  = q_shape.ndim();
         auto batch = q_shape.lens()[rank - 4];
         auto nhead = q_shape.lens()[rank - 3];
         auto m     = q_shape.lens()[rank - 2];
-        auto n     = k_shape.lens()[rank - 2];
+        auto k_dim = q_shape.lens()[rank - 1];
+        auto n     = (k_shape.lens()[rank - 2] == k_dim) ? k_shape.lens()[rank - 1]
+                                                         : k_shape.lens()[rank - 2];
         auto o     = v_shape.lens()[rank - 1];
 
         const bool has_bias = inputs.size() == 4;

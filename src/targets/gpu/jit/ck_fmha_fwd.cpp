@@ -67,12 +67,27 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
 {
     std::vector<std::string> names() const { return {"ck_fmha_fwd", "gpu::ck_fmha_fwd"}; }
 
+    static shape normalize_k_shape(const shape& k, std::size_t k_dim)
+    {
+        auto rank = k.ndim();
+        if(k.lens()[rank - 2] == k_dim and k.lens()[rank - 1] != k_dim)
+        {
+            auto l = k.lens();
+            auto s = k.strides();
+            std::swap(l[rank - 2], l[rank - 1]);
+            std::swap(s[rank - 2], s[rank - 1]);
+            return {k.type(), l, s};
+        }
+        return k;
+    }
+
     ck::host::device_fmha_fwd::Problem create_problem(const std::vector<shape>& inputs,
                                                       const value&) const
     {
         // inputs: [Q, K, V, output] or [Q, K, bias, V, output]
         const auto& q_shape = inputs[0];
-        const auto& k_shape = inputs[1];
+        auto k_dim          = q_shape.lens()[q_shape.ndim() - 1];
+        const auto k_shape  = normalize_k_shape(inputs[1], k_dim);
 
         const bool has_bias = inputs.size() == 5;
         const auto& o_shape = inputs.back();
@@ -134,6 +149,10 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
         assert(v.contains("scale"));
         auto scale = v.at("scale").to<float>();
 
+        auto k_dim          = inputs[0].lens()[inputs[0].ndim() - 1];
+        auto virtual_inputs = inputs;
+        virtual_inputs[1]   = normalize_k_shape(inputs[1], k_dim);
+
         hip_compile_options options;
         options.additional_src_files = ck_tile_headers();
         options.global               = problem.nhead * block_size;
@@ -143,6 +162,7 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
         options.local_y              = 1;
         options.local_z              = 1;
         options.inputs               = inputs;
+        options.virtual_inputs       = virtual_inputs;
         options.output               = o_shape;
         options.kernel_name          = v.get("kernel", std::string{"ck_fmha_fwd_kernel"});
         options.emplace_param("-DSCALE=" + std::to_string(scale));

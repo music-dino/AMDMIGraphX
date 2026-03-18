@@ -329,13 +329,7 @@ struct find_fmha_ck
         }
         inputs.push_back(gemm2_ins->inputs().back()); // V
 
-        // Undo the transpose on K: the FMHA kernel expects K in [batch, nhead, N, K]
-        auto& m           = mpm.get_module();
-        auto k_transposed = inputs[1];
-        auto k_original   = m.insert_instruction(
-            ins, migraphx::make_op("transpose", {{"permutation", {0, 1, 3, 2}}}), k_transposed);
-        inputs[1] = k_original;
-        m.replace_instruction(ins, pre_ck_fmha_fwd{scale}, inputs);
+        mpm.get_module().replace_instruction(ins, pre_ck_fmha_fwd{scale}, inputs);
     }
 };
 
