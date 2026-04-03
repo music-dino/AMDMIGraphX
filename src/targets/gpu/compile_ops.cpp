@@ -94,83 +94,100 @@ struct compiled_result
     }
 };
 
+struct compile_sub_plan
+{
+    operation preop;
+    optional<tuning_config> config                 = nullopt;
+    std::vector<optional<compiled_result>> results = {};
+};
+
 struct compile_plan
 {
     context* ctx;
-    operation preop;
     instruction_ref ins;
     module_ref mod;
-    optional<tuning_config> config                 = nullopt;
-    std::vector<optional<compiled_result>> results = {};
+    std::vector<compile_sub_plan> sub_plans;
+
     void update_config(bool exhaustive)
     {
-        config = get_tuning_config(*ctx, ins, preop, exhaustive);
+        for(auto& sp : sub_plans)
+            sp.config = get_tuning_config(*ctx, ins, sp.preop, exhaustive);
     }
+
     template <class Vector>
-    void insert_compiles(Vector& compiles, const value& solution, std::size_t i)
+    void insert_compiles(compile_sub_plan& sp, Vector& compiles, const value& solution,
+                         std::size_t i)
     {
-        compiles.emplace_back([=] {
+        compiles.emplace_back([this, &sp, solution, i] {
             try
             {
-                results[i] = compiled_result{compile(*ctx, ins, preop, solution), ins};
+                sp.results[i] = compiled_result{compile(*ctx, ins, sp.preop, solution), ins};
             }
             catch(const std::exception& e)
             {
                 const auto trace_level = value_of(MIGRAPHX_TRACE_BENCHMARKING{});
                 if(trace_level > 0)
-                    std::cerr << "Exception in " + preop.name() + ": " + e.what() << std::endl;
-                results[i] = nullopt;
+                    std::cerr << "Exception in " + sp.preop.name() + ": " + e.what() << std::endl;
+                sp.results[i] = nullopt;
             }
             catch(...)
             {
-                results[i] = nullopt;
+                sp.results[i] = nullopt;
             }
         });
     }
 
     template <class Vector>
-    void add_compiles(Vector& compiles)
+    void add_sub_plan_compiles(compile_sub_plan& sp, Vector& compiles)
     {
-        if(config.has_value())
+        if(sp.config.has_value())
         {
-            const auto& problem = config->problem;
-            if(auto sol = ctx->get_problem_cache().get(preop.name(), problem))
+            const auto& problem = sp.config->problem;
+            if(auto sol = ctx->get_problem_cache().get(sp.preop.name(), problem))
             {
                 const auto& solution = sol.value();
-                // No solution yet until benchmarked so skip for now
                 if(solution.is_null())
                     return;
-                results.resize(1);
-                insert_compiles(compiles, solution, 0);
+                sp.results.resize(1);
+                insert_compiles(sp, compiles, solution, 0);
             }
             else
             {
-                ctx->get_problem_cache().mark(preop.name(), problem);
-                const auto& solutions = config->solutions;
+                ctx->get_problem_cache().mark(sp.preop.name(), problem);
+                const auto& solutions = sp.config->solutions;
                 if(solutions.empty())
-                    MIGRAPHX_THROW("No solutions provided for " + preop.name() + " with " +
-                                   problem_string() + "\n\n" + print_modules());
-                results.resize(solutions.size());
+                    MIGRAPHX_THROW("No solutions provided for " + sp.preop.name() + " with " +
+                                   problem_string(sp) + "\n\n" + print_modules(sp));
+                sp.results.resize(solutions.size());
                 for(auto i : range(solutions.size()))
                 {
                     auto solution = solutions[i];
-                    insert_compiles(compiles, solution, i);
+                    insert_compiles(sp, compiles, solution, i);
                 }
             }
         }
         else
         {
-            results.resize(1);
-            insert_compiles(compiles, value{}, 0);
+            sp.results.resize(1);
+            insert_compiles(sp, compiles, value{}, 0);
         }
     }
-    std::string problem_string() const
+
+    template <class Vector>
+    void add_compiles(Vector& compiles)
     {
-        if(config)
-            return to_string(config->problem);
+        for(auto& sp : sub_plans)
+            add_sub_plan_compiles(sp, compiles);
+    }
+
+    static std::string problem_string(const compile_sub_plan& sp)
+    {
+        if(sp.config)
+            return to_string(sp.config->problem);
         return "<no problem key>";
     }
-    std::string print_modules() const
+
+    std::string print_modules(const compile_sub_plan& sp) const
     {
         std::stringstream current_module;
         for(auto* const m : ins->module_inputs())
@@ -185,11 +202,12 @@ struct compile_plan
                 submodules << to_string(*sm) << "\n";
             }
         }
-        return (config ? config->detailed_problem_info : "Problem: no config provided") +
+        return (sp.config ? sp.config->detailed_problem_info : "Problem: no config provided") +
                "\n\nModule:\n" + current_module.str() +
                (not submodules.str().empty() ? "\n" + submodules.str() : "") + "Input Shapes:\n" +
                print_input_shapes();
     }
+
     std::string print_input_shapes() const
     {
         std::stringstream input_shapes;
@@ -200,33 +218,66 @@ struct compile_plan
         return input_shapes.str();
     }
 
-    const compiled_result& benchmark() const
+    double time_compiled_result(const compiled_result& cr) const
+    {
+        program bench_prog;
+        auto* bench_mm = bench_prog.get_main_module();
+        std::vector<instruction_ref> bench_ins_inputs;
+
+        std::transform(cr.ins->inputs().begin(),
+                       cr.ins->inputs().end(),
+                       std::back_inserter(bench_ins_inputs),
+                       [&](const auto& arg) {
+                           return bench_mm->add_parameter(
+                               std::to_string(bench_ins_inputs.size()), arg->get_shape());
+                       });
+        auto bench_ins = bench_mm->add_instruction(
+            cr.ins->get_operator(), bench_ins_inputs, cr.ins->module_inputs());
+        bench_mm->add_return({bench_ins});
+        cr.replace.replace(*bench_mm, bench_ins);
+        run_passes(*bench_mm,
+                   {
+                       eliminate_identity{},
+                       dead_code_elimination{},
+                       memory_coloring{"hip::allocate"},
+                   });
+        const auto trace_level = value_of(MIGRAPHX_TRACE_BENCHMARKING{});
+        if(trace_level > 2)
+            std::cout << bench_prog << std::endl;
+        auto t = time_program(
+            *ctx, bench_prog, cr.replace.fill_map, /* bundle */ 10, /* nrun */ 20);
+        if(trace_level > 1)
+            std::cout << t << "ms" << std::endl;
+        return t;
+    }
+
+    const compiled_result& benchmark_sub_plan(const compile_sub_plan& sp) const
     {
         const auto trace_level = value_of(MIGRAPHX_TRACE_BENCHMARKING{});
-        if(trace_level > 0 and not results.empty())
+        if(trace_level > 0 and not sp.results.empty())
         {
-            std::cout << "Benchmarking " << preop.name() << ": " << results.size() << " configs"
-                      << std::endl;
+            std::cout << "Benchmarking " << sp.preop.name() << ": " << sp.results.size()
+                      << " configs" << std::endl;
         }
-        if(results.empty())
-            MIGRAPHX_THROW("No valid tuned compilation for " + preop.name() + " with " +
-                           problem_string() + "\n\n" + print_modules());
-        if(results.size() == 1)
+        if(sp.results.empty())
+            MIGRAPHX_THROW("No valid tuned compilation for " + sp.preop.name() + " with " +
+                           problem_string(sp) + "\n\n" + print_modules(sp));
+        if(sp.results.size() == 1)
         {
-            if(not results.front().has_value())
-                MIGRAPHX_THROW("No valid tuned compilation for " + preop.name() + " with " +
-                               problem_string() + "\n\n" + print_modules());
-            return *results.front();
+            if(not sp.results.front().has_value())
+                MIGRAPHX_THROW("No valid tuned compilation for " + sp.preop.name() + " with " +
+                               problem_string(sp) + "\n\n" + print_modules(sp));
+            return *sp.results.front();
         }
-        if(not config)
-            MIGRAPHX_THROW("Multiple kernels without config for " + preop.name());
+        if(not sp.config)
+            MIGRAPHX_THROW("Multiple kernels without config for " + sp.preop.name());
         if(trace_level > 1)
-            std::cout << "Problem: " << config->problem << std::endl;
+            std::cout << "Problem: " << sp.config->problem << std::endl;
         std::vector<double> times;
-        times.reserve(results.size());
-        std::transform(results.begin(),
-                       results.end(),
-                       config->solutions.begin(),
+        times.reserve(sp.results.size());
+        std::transform(sp.results.begin(),
+                       sp.results.end(),
+                       sp.config->solutions.begin(),
                        std::back_inserter(times),
                        [&](const auto& cr, const auto& solution) {
                            if(trace_level > 1)
@@ -239,62 +290,76 @@ struct compile_plan
                            }
                            if(trace_level > 2)
                                std::cout << *cr << std::endl;
-                           /*
-                           create a small program with insturction being compiled and call "replace"
-                           on that which would insert all the compiled code objects, prefills etc.
-                           necessary to run candidate code object
-                           */
-                           program bench_prog;
-                           auto* bench_mm = bench_prog.get_main_module();
-                           std::vector<instruction_ref> bench_ins_inputs;
-
-                           std::transform(cr->ins->inputs().begin(),
-                                          cr->ins->inputs().end(),
-                                          std::back_inserter(bench_ins_inputs),
-                                          [&](const auto& arg) {
-                                              return bench_mm->add_parameter(
-                                                  std::to_string(bench_ins_inputs.size()),
-                                                  arg->get_shape());
-                                          });
-                           auto bench_ins = bench_mm->add_instruction(
-                               cr->ins->get_operator(), bench_ins_inputs, cr->ins->module_inputs());
-                           bench_mm->add_return({bench_ins});
-                           cr->replace.replace(*bench_mm, bench_ins);
-                           // do dead code elimination
-                           run_passes(*bench_mm,
-                                      {
-                                          eliminate_identity{},
-                                          dead_code_elimination{},
-                                          memory_coloring{"hip::allocate"},
-                                      });
-                           if(trace_level > 2)
-                               std::cout << bench_prog << std::endl;
-                           auto t = time_program(*ctx,
-                                                 bench_prog,
-                                                 cr->replace.fill_map,
-                                                 /* bundle */ 10,
-                                                 /* nrun */ 20);
-                           if(trace_level > 1)
-                               std::cout << t << "ms" << std::endl;
-                           return t;
+                           return time_compiled_result(*cr);
                        });
         std::this_thread::sleep_for(std::chrono::milliseconds{50});
         auto i = std::distance(times.begin(), std::min_element(times.begin(), times.end()));
-        ctx->get_problem_cache().insert(preop.name(), config->problem, config->solutions.at(i));
+        ctx->get_problem_cache().insert(
+            sp.preop.name(), sp.config->problem, sp.config->solutions.at(i));
         if(trace_level > 0)
         {
-            std::cout << "Fastest solution: " << config->solutions.at(i) << std::endl;
+            std::cout << "Fastest solution: " << sp.config->solutions.at(i) << std::endl;
             ctx->get_problem_cache().save();
         }
-        if(not results[i].has_value())
-            MIGRAPHX_THROW("No valid tuned compilation for " + preop.name() + " with " +
-                           problem_string() + "\n\n" + print_modules());
+        if(not sp.results[i].has_value())
+            MIGRAPHX_THROW("No valid tuned compilation for " + sp.preop.name() + " with " +
+                           problem_string(sp) + "\n\n" + print_modules(sp));
         auto skipped = std::count_if(
-            results.begin(), results.end(), [](const auto& cr) { return not cr.has_value(); });
+            sp.results.begin(), sp.results.end(), [](const auto& cr) { return not cr.has_value(); });
         if(skipped > 0)
-            std::cout << "Skipped " << skipped << " configs for " << preop.name() << std::endl;
+            std::cout << "Skipped " << skipped << " configs for " << sp.preop.name() << std::endl;
 
-        return *results[i];
+        return *sp.results[i];
+    }
+
+    const compiled_result& benchmark() const
+    {
+        std::vector<const compile_sub_plan*> active;
+        for(const auto& sp : sub_plans)
+        {
+            if(not sp.results.empty())
+                active.push_back(&sp);
+        }
+        if(active.empty())
+            MIGRAPHX_THROW("No valid tuned compilation\n\n" + print_modules(sub_plans.front()));
+        if(active.size() == 1)
+            return benchmark_sub_plan(*active.front());
+
+        const compiled_result* best    = nullptr;
+        double best_time               = std::numeric_limits<double>::max();
+        const auto trace_level         = value_of(MIGRAPHX_TRACE_BENCHMARKING{});
+        for(const auto* sp : active)
+        {
+            try
+            {
+                const auto& cr = benchmark_sub_plan(*sp);
+                double t       = time_compiled_result(cr);
+                if(trace_level > 0)
+                    std::cout << sp->preop.name() << " best: " << t << "ms" << std::endl;
+                if(t < best_time)
+                {
+                    best      = &cr;
+                    best_time = t;
+                }
+            }
+            catch(const std::exception& e)
+            {
+                if(trace_level > 0)
+                    std::cerr << "Sub-plan " << sp->preop.name() << " failed: " << e.what()
+                              << std::endl;
+            }
+        }
+        if(not best)
+            MIGRAPHX_THROW("All sub-plans failed\n\n" + print_modules(sub_plans.front()));
+        if(trace_level > 0)
+            std::cout << "Overall winner: " << best_time << "ms" << std::endl;
+        return *best;
+    }
+
+    bool has_results() const
+    {
+        return std::any_of(sub_plans.begin(), sub_plans.end(),
+                           [](const auto& sp) { return not sp.results.empty(); });
     }
 
     void replace(module& m) const
@@ -320,10 +385,9 @@ struct compile_manager
     std::vector<compile_plan> cps;
     bool exhaustive = false;
 
-    template <class... Ts>
-    void add_plan(Ts&&... xs)
+    void add_plan(context* c, const operation& preop, instruction_ref i, module_ref m)
     {
-        cps.push_back({std::forward<Ts>(xs)...});
+        cps.push_back({c, i, m, {compile_sub_plan{preop}}});
     }
 
     void update_configs()
@@ -343,7 +407,7 @@ struct compile_manager
         // Replace and/or benchmark
         for(const auto& cp : cps)
         {
-            if(cp.results.empty())
+            if(not cp.has_results())
                 continue;
             cp.replace(m);
         }
@@ -351,7 +415,7 @@ struct compile_manager
         // Remove compile_plan already executed
         cps.erase(std::remove_if(cps.begin(),
                                  cps.end(),
-                                 [](const auto& cp) { return not cp.results.empty(); }),
+                                 [](const auto& cp) { return cp.has_results(); }),
                   cps.end());
     }
 };
@@ -367,6 +431,25 @@ void compile_ops::apply(module& m) const
             continue;
         operation preop = any_cast<precompile_op>(ins->get_operator()).op;
         cm.add_plan(ctx, preop, ins, &m);
+
+        if(cm.exhaustive and preop.name() == "gpu::mlir_op")
+        {
+            std::cout << "MODS SIZE: " << ins->module_inputs().size() << std::endl;
+            auto mods = ins->module_inputs();
+            if(mods.size() > 1)
+            {
+                auto* ck_mod = mods[1];
+                std::cout << *ck_mod << std::endl;
+                for(auto& ck_ins : *ck_mod)
+                {
+                    if(ck_ins.name() != "gpu::ck_fmha_fwd")
+                        continue;
+                    std::cout << "ADDING CK FMHA FWD SUBPLAN" << std::endl;
+                    cm.cps.back().sub_plans.push_back({ck_ins.get_operator()});
+                    break;
+                }
+            }
+        }
     }
     cm.update_configs();
     cm.compile(m);

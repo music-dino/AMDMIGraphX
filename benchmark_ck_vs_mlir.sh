@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 DRIVER="${BUILD_DIR}/bin/driver"
 CK_DIR="${BUILD_DIR}/saved_models/ck_models"
-MLIR_DIR="${BUILD_DIR}/saved_models/mlir_models"
-CSV="${SCRIPT_DIR}/benchmark_ck_vs_mlir.csv"
+MLIR_DIR="${BUILD_DIR}/saved_models/mlir_quick_models"
+CSV="${SCRIPT_DIR}/benchmark_ck_vs_mlir_quick.csv"
 NITER=1000
 
 print_stats() {
@@ -99,14 +99,14 @@ echo "batch,nhead,M,N,K,O,ck_time_ms,mlir_time_ms,faster,delta_ms,speedup_pct" >
 BATCH=2
 NHEAD=4
 
-for M in 512; do
+for M in 512 1024 2048 4096; do
     for N in 512 1024 2048 4096; do
         for K in 32 48 64 80 96 128 192 256; do
             for O in 32 48 64 80 96 128 192 256; do
                 TAG="${BATCH}_${NHEAD}_${M}_${N}_${K}_${O}"
 
                 CK_MODEL="${CK_DIR}/ck_${TAG}.mxr"
-                MLIR_MODEL="${MLIR_DIR}/mlir_${TAG}.mxr"
+                MLIR_MODEL="${MLIR_DIR}/mlir_quick_${TAG}.mxr"
 
                 if [[ ! -f "$CK_MODEL" ]]; then
                     echo "SKIP (missing): $CK_MODEL"

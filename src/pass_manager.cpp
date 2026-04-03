@@ -207,6 +207,13 @@ void run_passes(program& prog, module_ref root_mod, const std::vector<pass>& pas
     std::unordered_set<module_ref> visited;
     for(const auto& p : passes)
     {
+        if(p.name() == "gpu::compile_ops") {
+            std::cout << prog << std::endl;
+        }
+        if(p.name() == "promote_literals") {
+            std::cout << prog << std::endl;
+            // throw 5;
+        }
         auto tree                        = prog.get_module_tree();
         std::vector<module_ref> sub_mods = root_mod->get_sub_modules();
         sub_mods.insert(sub_mods.begin(), root_mod);

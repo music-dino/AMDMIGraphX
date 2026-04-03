@@ -23,9 +23,12 @@
  */
 
 #include <migraphx/matcher.hpp>
+#include <migraphx/match/softmax.hpp>
 #include <migraphx/pass_manager.hpp>
 #include <migraphx/stringutils.hpp>
 #include <migraphx/register_op.hpp>
+#include <migraphx/param_utils.hpp>
+#include <migraphx/make_op.hpp>
 #include <migraphx/gpu/fuse_ck.hpp>
 #include <migraphx/gpu/gemm_softmax_gemm.hpp>
 #include <migraphx/gpu/device_name.hpp>
@@ -84,7 +87,23 @@ MIGRAPHX_REGISTER_OP(ck_gemm_softmax_gemm);
 
 struct ck_fmha_fwd : fmha_fwd_base
 {
+    bool has_bias = false;
+
+    template <class Self, class F>
+    static auto reflect(Self& self, F f)
+    {
+        return pack(f(self.scale, "scale"), f(self.has_bias, "has_bias"));
+    }
+
     std::string name() const { return "gpu::ck_fmha_fwd"; }
+
+    shape compute_shape(std::vector<shape> inputs, const std::vector<module_ref>& mods) const
+    {
+        std::size_t expected = has_bias ? 4 : 3;
+        if(inputs.size() > expected)
+            inputs.erase(inputs.begin() + 2);
+        return fmha_fwd_base::compute_shape(inputs, mods);
+    }
 };
 MIGRAPHX_REGISTER_OP(ck_fmha_fwd);
 
@@ -219,7 +238,178 @@ struct find_ck_fmha_fwd
         auto v   = ins->get_operator().to_value();
         assert(v.contains("scale"));
         auto scale = v.at("scale").to<float>();
-        mpm.get_module().replace_instruction(ins, ck_fmha_fwd{scale}, ins->inputs());
+        bool bias = ins->inputs().size() == 4;
+        mpm.get_module().replace_instruction(ins, ck_fmha_fwd{scale, bias}, ins->inputs());
+    }
+};
+
+struct decomposed_fmha_checker
+{
+    bool matched              = false;
+    instruction_ref q_param   = {};
+    instruction_ref k_param   = {};
+    instruction_ref v_param   = {};
+    instruction_ref scale_input = {};
+    instruction_ref bias_input  = {};
+    bool has_scale = false;
+    bool has_bias  = false;
+
+    auto matcher() const
+    {
+        auto gemm1 =
+            match::skip(match::name("convert"))(match::name("dot").bind("gemm1"));
+        auto mul = match::name("mul")(
+            match::nargs(2), match::either_arg(0, 1)(match::any().bind("scale_input"), gemm1));
+        auto add_with_scale = match::name("add")(
+            match::nargs(2),
+            match::either_arg(0, 1)(match::none_of(mul).bind("bias_input"), mul));
+        auto add_no_scale = match::name("add")(
+            match::nargs(2),
+            match::either_arg(0, 1)(match::none_of(gemm1).bind("bias_input"), gemm1));
+        auto softmax = match::skip(match::name("convert"))(
+            match::softmax_input(match::any_of(add_with_scale, mul, add_no_scale, gemm1)));
+
+        return match::name("dot")(match::arg(0)(softmax)).bind("gemm2");
+    }
+
+    void apply(module&, const match::matcher_result& r)
+    {
+        auto gemm1 = r.instructions["gemm1"];
+        auto gemm2 = r.instructions["gemm2"];
+        matched = true;
+        q_param = gemm1->inputs()[0];
+        k_param = gemm1->inputs()[1];
+        v_param = gemm2->inputs()[1];
+        if(contains(r.instructions, "scale_input"))
+        {
+            has_scale  = true;
+            scale_input = r.instructions["scale_input"];
+        }
+        if(contains(r.instructions, "bias_input"))
+        {
+            has_bias  = true;
+            bias_input = r.instructions["bias_input"];
+        }
+    }
+};
+
+static instruction_ref trace_to_param(instruction_ref ins)
+{
+    while(ins->name() != "@param")
+    {
+        if(ins->inputs().empty())
+            return {};
+        ins = ins->inputs()[0];
+    }
+    return ins;
+}
+
+struct find_ck_fmha_attention
+{
+    auto matcher() const
+    {
+        return match::name("group")(match::has_op_value("tag", "attention")).bind("group");
+    }
+
+    void apply(module_pass_manager& mpm, const match::matcher_result& r) const
+    {
+        auto group_ins = r.instructions["group"];
+        auto* submod   = group_ins->module_inputs().front();
+
+        if(group_ins->module_inputs().size() > 1)
+            return;
+
+        auto return_ins = std::prev(submod->end());
+        if(return_ins->name() != "@return" or return_ins->inputs().size() > 1)
+            return;
+
+        decomposed_fmha_checker checker;
+        match::find_matches(*submod, checker);
+
+        if(not checker.matched)
+            return;
+
+        if(checker.q_param->name() != "@param" or checker.k_param->name() != "@param" or
+           checker.v_param->name() != "@param")
+            return;
+
+        auto group_inputs = group_ins->inputs();
+        auto param_map    = submod->get_ins_param_map(group_inputs, true);
+
+        auto q_main = param_map.at(checker.q_param);
+        auto k_main = param_map.at(checker.k_param);
+        auto v_main = param_map.at(checker.v_param);
+
+        if(not ck_gemm::is_ck_supported_type(q_main->get_shape().type()))
+            return;
+        if(q_main->get_shape().ndim() != 4)
+            return;
+        if(q_main->get_shape().strides().back() != 1)
+            return;
+
+        float scale = 1.0f;
+        instruction_ref scale_main = {};
+        if(checker.has_scale)
+        {
+            auto scale_param = trace_to_param(checker.scale_input);
+            if(scale_param->name() != "@param")
+                return;
+            scale_main = param_map.at(scale_param);
+            if(not scale_main->can_eval())
+                return;
+            scale_main->eval().visit([&](const auto s) {
+                if(not std::all_of(
+                       s.begin() + 1, s.end(), [&](auto v) { return float_equal(v, s.front()); }))
+                    return;
+                scale = s.front();
+            });
+        }
+
+        instruction_ref bias_main = {};
+        if(checker.has_bias)
+        {
+            auto bias_param = trace_to_param(checker.bias_input);
+            if(bias_param->name() != "@param")
+                return;
+            bias_main = param_map.at(bias_param);
+        }
+
+        module ck_mod;
+        std::size_t param_idx = 0;
+        auto ck_q = ck_mod.add_parameter(param_name(param_idx++), q_main->get_shape());
+        auto ck_k = ck_mod.add_parameter(param_name(param_idx++), k_main->get_shape());
+
+        std::vector<instruction_ref> ck_inputs = {ck_q, ck_k};
+
+        if(checker.has_scale)
+        {
+            auto ck_scale =
+                ck_mod.add_parameter(param_name(param_idx++), scale_main->get_shape());
+            ck_inputs.push_back(ck_scale);
+        }
+
+        if(checker.has_bias)
+        {
+            auto ck_bias =
+                ck_mod.add_parameter(param_name(param_idx++), bias_main->get_shape());
+            ck_inputs.push_back(ck_bias);
+        }
+
+        auto ck_v = ck_mod.add_parameter(param_name(param_idx++), v_main->get_shape());
+        ck_inputs.push_back(ck_v);
+
+        auto ck_fmha_ins =
+            ck_mod.add_instruction(ck_fmha_fwd{scale, checker.has_bias}, ck_inputs);
+        ck_mod.add_return({ck_fmha_ins});
+
+        auto ck_mod_ref = mpm.create_module("ck_" + submod->name(), std::move(ck_mod));
+        ck_mod_ref->set_bypass();
+
+        mpm.get_module().replace_instruction(
+            group_ins,
+            make_op("group", {{"tag", "attention"}}),
+            group_ins->inputs(),
+            {submod, ck_mod_ref});
     }
 };
 
@@ -227,6 +417,7 @@ struct find_ck_fmha_fwd
 
 void fuse_ck::apply(module_pass_manager& mpm) const
 {
+    match::find_matches(mpm, find_ck_fmha_attention{});
     match::find_matches(mpm, find_ck_fmha_fwd{});
     match::find_matches(mpm, find_ck_gemm_softmax_gemm{});
     match::find_matches(mpm, find_ck_gemm_pointwise{});

@@ -83,8 +83,8 @@ TEST_CASE(ck_fmha_fwd_test)
     const std::size_t nhead = 4;
     const std::size_t M     = 512; // seqlen_q
     const std::size_t N     = 512; // seqlen_k
-    const std::size_t K     = 32;  // hdim_q = hdim_k
-    const std::size_t O     = 32;  // hdim_v
+    const std::size_t K     = 64;  // hdim_q = hdim_k
+    const std::size_t O     = 192;  // hdim_v
 
     migraphx::program p;
     auto* mm = p.get_main_module();
@@ -139,7 +139,7 @@ TEST_CASE(ck_fmha_fwd_test)
 
     migraphx::compile_options gpu_opts;
     gpu_opts.offload_copy    = true;
-    gpu_opts.exhaustive_tune = true;
+    gpu_opts.exhaustive_tune = false;
     gpu_p.compile(migraphx::make_target("gpu"), gpu_opts);
     std::cout << gpu_p << std::endl;
     auto gpu_result = gpu_p.eval(params).back();
@@ -234,6 +234,7 @@ TEST_CASE(attention_models)
     std::vector<size_t> seqlens_k{512, 1024, 2048, 4096};
     std::vector<size_t> hdims_q{32, 48, 64, 80, 96, 128, 192, 256};
     std::vector<size_t> hdims_v{32, 48, 64, 80, 96, 128, 192, 256};
+    uint32_t num_iters = 0;
 
     for(const auto& seqlen_q : seqlens_q)
     {
@@ -243,6 +244,7 @@ TEST_CASE(attention_models)
             {
                 for(const auto& hdim_v : hdims_v)
                 {
+                    if(num_iters++ >= 680) break;
                     // if(seqlen_q != 512 or seqlen_k != 512 or hdim_q != 32 or hdim_v != 32) {
                     //     continue;
                     // }
@@ -291,11 +293,11 @@ TEST_CASE(attention_models)
                     auto gpu_p = p;
                     migraphx::compile_options gpu_opts;
                     // gpu_opts.offload_copy    = true;
-                    gpu_opts.exhaustive_tune = true;
+                    gpu_opts.exhaustive_tune = false;
                     std::stringstream ss;
-                    ss << "mlir_" << batch << "_" << nhead << "_" << M << "_" << N
+                    ss << "mlir_quick_" << batch << "_" << nhead << "_" << M << "_" << N
                        << "_" << K << "_" << O << ".mxr";
-                    std::string check_filename = "saved_models/mlir_models/" + ss.str();
+                    std::string check_filename = "saved_models/mlir_quick_models/" + ss.str();
                     if(std::filesystem::exists(check_filename))
                     {
                         std::cout << "Skipping, file already exists: " << check_filename << std::endl;
@@ -378,12 +380,12 @@ TEST_CASE(combinations)
 
     // std::vector<std::size_t> batches{1, 2, 16};
     // std::vector<std::size_t> nheads{4, 8, 16};
-    std::vector<std::size_t> batches{2};
-    std::vector<std::size_t> nheads{4};
+    std::vector<std::size_t> batches{2, 4};
+    std::vector<std::size_t> nheads{4, 2};
     std::vector<std::size_t> seqlens_q{512, 1024};
     std::vector<std::size_t> seqlens_k{512, 1024};
-    std::vector<std::size_t> hdims_q{32, 64, 96};
-    std::vector<std::size_t> hdims_v{32, 64, 96};
+    std::vector<std::size_t> hdims_q{32, 64, 96, 128};
+    std::vector<std::size_t> hdims_v{32, 64, 96, 128};
 
     for(auto batch : batches)
         for(auto nhead : nheads)

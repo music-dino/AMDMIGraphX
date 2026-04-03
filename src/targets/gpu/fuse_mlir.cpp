@@ -203,8 +203,8 @@ struct mlir_op
     {
         module_ref mod = mods[0];
         check_shapes{inputs, *this, true}.has_at_least(1);
-        if(mods.size() != 1)
-            MIGRAPHX_THROW("should have one submodule.");
+        if(mods.empty())
+            MIGRAPHX_THROW("should have at least one submodule.");
 
         if(not std::all_of(inputs.begin(), inputs.end(), &is_mlir_compatible))
             MIGRAPHX_THROW("Shape is not mlir compatible.");
@@ -1131,8 +1131,13 @@ struct find_mlir_attention_op
         auto map_mlir_attn_to_main = invert_map_ins(map_main_to_mlir_attn);
         auto new_inputs            = mlir_attn->get_inputs(map_mlir_attn_to_main);
 
+        std::vector<module_ref> mlir_mods = {mlir_attn};
+        auto group_mods = group->module_inputs();
+        if(group_mods.size() > 1)
+            mlir_mods.insert(mlir_mods.end(), group_mods.begin() + 1, group_mods.end());
+
         auto mlir_ins = mpm.get_module().insert_instruction(
-            group, mlir_op{make_op("dot")}, mlir_contiguous(mpm, new_inputs), {mlir_attn});
+            group, mlir_op{make_op("dot")}, mlir_contiguous(mpm, new_inputs), mlir_mods);
 
         if(inss_to_replace.empty())
         {

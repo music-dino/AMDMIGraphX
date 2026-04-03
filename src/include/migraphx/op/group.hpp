@@ -45,8 +45,8 @@ struct group
 
     shape compute_shape(const std::vector<shape>& inputs, const std::vector<module_ref>& mods) const
     {
-        if(mods.size() != 1)
-            MIGRAPHX_THROW("should have one submodule.");
+        if(mods.empty())
+            MIGRAPHX_THROW("should have at least one submodule.");
         module_ref mod = mods[0];
         check_shapes{inputs, *this}.has_at_least(1);
 

@@ -81,10 +81,20 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
         return k;
     }
 
+    static std::vector<shape> strip_scale(const std::vector<shape>& inputs, bool has_bias)
+    {
+        std::size_t expected = has_bias ? 5 : 4;
+        if(inputs.size() <= expected)
+            return inputs;
+        auto result = inputs;
+        result.erase(result.begin() + 2);
+        return result;
+    }
+
     ck::host::device_fmha_fwd::Problem create_problem(const std::vector<shape>& inputs,
                                                       const value&) const
     {
-        // inputs: [Q, K, V, output] or [Q, K, bias, V, output]
+        // inputs (already stripped of scale): [Q, K, V, output] or [Q, K, bias, V, output]
         const auto& q_shape = inputs[0];
         auto k_dim          = q_shape.lens()[q_shape.ndim() - 1];
         const auto k_shape  = normalize_k_shape(inputs[1], k_dim);
@@ -113,10 +123,13 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
 
     operation compile_op(context& ctx, const std::vector<shape>& inputs, const value& v) const
     {
-        auto tuning_value = v.get("tuning_value", 0);
-        auto problem      = create_problem(inputs, v);
+        auto has_bias        = v.get("has_bias", false);
+        auto stripped_inputs = strip_scale(inputs, has_bias);
 
-        const auto& o_shape = inputs.back();
+        auto tuning_value = v.get("tuning_value", 0);
+        auto problem      = create_problem(stripped_inputs, v);
+
+        const auto& o_shape = stripped_inputs.back();
 
         auto arch = ctx.get_current_device().get_gfx_name();
 
@@ -126,9 +139,7 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
             MIGRAPHX_THROW("No FMHA solutions for arch " + arch);
         const auto& solution    = solutions.at(tuning_value);
         const auto template_str = solution.ToTemplateString();
-        // std::cout << tuning_value << ":\n" << template_str << std::endl;
 
-        // Compute launch dimensions
         auto bm0 = solution.GetTemplateParameter<std::size_t>("BM0");
         auto bn1 = solution.GetTemplateParameter<std::size_t>("BN1");
 
@@ -149,9 +160,9 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
         assert(v.contains("scale"));
         auto scale = v.at("scale").to<float>();
 
-        auto k_dim          = inputs[0].lens()[inputs[0].ndim() - 1];
-        auto virtual_inputs = inputs;
-        virtual_inputs[1]   = normalize_k_shape(inputs[1], k_dim);
+        auto k_dim          = stripped_inputs[0].lens()[stripped_inputs[0].ndim() - 1];
+        auto virtual_inputs = stripped_inputs;
+        virtual_inputs[1]   = normalize_k_shape(stripped_inputs[1], k_dim);
 
         hip_compile_options options;
         options.additional_src_files = ck_tile_headers();
@@ -161,25 +172,27 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
         options.local                = block_size;
         options.local_y              = 1;
         options.local_z              = 1;
-        options.inputs               = inputs;
+        options.inputs               = stripped_inputs;
         options.virtual_inputs       = virtual_inputs;
         options.output               = o_shape;
         options.kernel_name          = v.get("kernel", std::string{"ck_fmha_fwd_kernel"});
         options.emplace_param("-DSCALE=" + std::to_string(scale));
         options.emplace_param("-DCK_TILE_FMHA_FWD_FAST_EXP2=1");
         options.emplace_param("-fgpu-flush-denormals-to-zero");
-        auto src = interpolate_string(ck_fmha_fwd_kernel,
-                                      {{"include", include_header},
-                                       {"solution", template_str},
-                                       {"kernel", options.kernel_name},
-                                       {"params", enum_params(inputs.size(), "void * private_p")},
-                                       {"args", enum_params(inputs.size(), "private_p")}});
+        auto src = interpolate_string(
+            ck_fmha_fwd_kernel,
+            {{"include", include_header},
+             {"solution", template_str},
+             {"kernel", options.kernel_name},
+             {"params", enum_params(stripped_inputs.size(), "void * private_p")},
+             {"args", enum_params(stripped_inputs.size(), "private_p")}});
 
         return compile_hip_code_object(ctx, src, options);
     }
 
     value create_settings(instruction_ref, const operation& op) const
     {
+        std::cout << "CK FMHA FWD create_settings" << std::endl;
         auto v      = op.to_value();
         v["kernel"] = "ck_fmha_fwd_kernel";
         return v;
@@ -188,24 +201,34 @@ struct ck_fmha_fwd_compiler : compiler<ck_fmha_fwd_compiler>
     compiler_replace
     compile(context& ctx, instruction_ref ins, const operation& op, const value& solution) const
     {
+        std::cout << "CK FMHA FWD compile" << std::endl;
         auto shapes = to_shapes(ins->inputs());
         auto v      = create_settings(ins, op);
         if(not solution.is_null())
             v["tuning_value"] = solution;
-        return {compile_op(ctx, shapes, v),
-                [=](module& m, instruction_ref ins2, const operation& code_object) {
-                    m.replace_instruction(ins2, code_object, ins2->inputs());
+        auto has_bias        = v.get("has_bias", false);
+        auto stripped_shapes = strip_scale(shapes, has_bias);
+        return {compile_op(ctx, stripped_shapes, v),
+                [has_bias](module& m, instruction_ref ins2, const operation& code_object) {
+                    auto inputs = ins2->inputs();
+                    std::size_t expected = has_bias ? 5 : 4;
+                    if(inputs.size() > expected)
+                        inputs.erase(inputs.begin() + 2);
+                    m.replace_instruction(ins2, code_object, inputs);
                 }};
     }
 
     optional<tuning_config>
     get_tuning_config(context& ctx, instruction_ref ins, const operation& op, bool exhaustive) const
     {
+        std::cout << "CK FMHA FWD get_tuning_config" << std::endl;
         if(not exhaustive and not enabled(MIGRAPHX_TUNE_CK{}))
             return nullopt;
         tuning_config tc;
-        auto shapes    = to_shapes(ins->inputs());
-        auto problem   = create_problem(shapes, create_settings(ins, op));
+        auto v         = create_settings(ins, op);
+        auto has_bias  = v.get("has_bias", false);
+        auto shapes    = strip_scale(to_shapes(ins->inputs()), has_bias);
+        auto problem   = create_problem(shapes, v);
         auto solutions = problem.GetSolutions(ctx.get_current_device().get_gfx_name());
         tc.solutions.resize(solutions.size());
         std::iota(tc.solutions.begin(), tc.solutions.end(), 0);
